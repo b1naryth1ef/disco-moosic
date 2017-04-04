@@ -1,0 +1,11 @@
+token: 'TOKEN GOES HERE'
+
+bot:
+  commands_require_mention: false
+  commands_prefix: '!'
+
+  plugins:
+    - moosic.moosic 
+  levels:
+    80351110224678912: owner
+
