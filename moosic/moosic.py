@@ -1,12 +1,10 @@
 from __future__ import print_function
 
 import gevent
-import random
 import tempfile
 import humanize
 
 from datetime import timedelta
-from gevent.event import Event
 
 from disco.bot import Plugin, Config
 from disco.types.user import Status, GameType, Game
@@ -15,8 +13,9 @@ from disco.bot.command import CommandError
 
 from disco.voice import (
     Player, VoiceException, YoutubeDLInput, OpusFilePlayable, BufferedOpusEncoderPlayable,
-    FileProxyPlayable, BasePlayable, AbstractOpus
+    FileProxyPlayable
 )
+from disco.voice.queue import PlayableQueue
 
 from .cache import LRUDiskCache
 
@@ -24,95 +23,25 @@ from .cache import LRUDiskCache
 NEXT_TRACK = u'\U000023ED'
 PLAY_PAUSE = u'\U000023EF'
 SHUFFLE = u'\U0001F500'
+CLEAR = u'\U0001F5D1'
+STOP = u'\U0000274C'
+
+ALL_EMOJIS = (STOP, PLAY_PAUSE, NEXT_TRACK, SHUFFLE, CLEAR)
 
 
-class MusicQueuePlayable(BasePlayable, AbstractOpus):
-    def __init__(self, parent, player, channel, *args, **kwargs):
-        super(MusicQueuePlayable, self).__init__(*args, **kwargs)
+class MusicQueue(PlayableQueue):
+    def __init__(self, parent, on_next=None):
+        super(MusicQueue, self).__init__()
         self.parent = parent
-        self.player = player
-        self.channel = channel
-        self.msg = None
-        self._current = None
-        self._entries = []
-        self._event = None
+        self._on_next = on_next
 
-        def reaction_matcher(e):
-            return (
-                e.channel_id == self.channel.id and
-                e.emoji.name in (NEXT_TRACK, PLAY_PAUSE, SHUFFLE) and
-                e.user_id != self.channel.client.state.me.id)
+    def get(self):
+        item = super(MusicQueue, self)._get()
 
-        self._listener = self.channel.client.events.on(
-            'MessageReactionAdd', self._on_reaction, conditional=reaction_matcher)
-
-    def __del__(self):
-        self._listener.remove()
-
-    def _on_reaction(self, event):
-        if event.emoji.name == NEXT_TRACK:
-            self.skip()
-        elif event.emoji.name == PLAY_PAUSE:
-            if self.player.paused:
-                self.player.resume()
-            else:
-                self.player.pause()
-        elif event.emoji.name == SHUFFLE:
-            self.shuffle()
-
-        self.msg.delete_reaction(event.emoji.name, event.user_id)
-
-    def _on_play(self, info):
-        # If only one guild is playing music, update our status
-        if len(self.parent.guilds) == 1:
-            self.parent.client.update_presence(
-                Status.ONLINE,
-                Game(
-                    type=GameType.DEFAULT,
-                    name=info['title'],
-                ))
-
-        embed = MessageEmbed()
-        embed.title = u'{}'.format(info['title'])
-        embed.url = info['webpage_url']
-        embed.color = 0x77dd77
-        embed.set_image(url=info['thumbnail'])
-        embed.add_field(name='Uploader', value=info['uploader'])
-
-        if 'view_count' in info:
-            embed.add_field(name='Views', value=info['view_count'])
-
-        if 'duration' in info:
-            embed.add_field(name='Duration', value=humanize.naturaldelta(timedelta(seconds=info['duration'])))
-
-        if not self.msg:
-            self.msg = self.channel.send_message(embed=embed)
-
-            # Do this in a greenlet because its fairly heavily rate-limited
-            def add_reactions():
-                self.msg.create_reaction(PLAY_PAUSE)
-                self.msg.create_reaction(NEXT_TRACK)
-                self.msg.create_reaction(SHUFFLE)
-            gevent.spawn(add_reactions)
-        else:
-            self.msg.edit(embed=embed)
-
-    def shuffle(self):
-        random.shuffle(self._entries)
-
-    def add(self, item):
-        self._entries.append(item)
-        if self._event:
-            self._event.set()
-
-    def skip(self):
-        self._current = None
-
-    def _get_next_playable(self):
-        item = self._entries.pop(0)
-
-        # Pipe the item into the encoder
         item = item.pipe(BufferedOpusEncoderPlayable)
+
+        if self._on_next and callable(self._on_next):
+            gevent.spawn(self._on_next, item)
 
         if self.parent.cache:
             # If the item exists in our cache, just replace the playable entirely
@@ -135,38 +64,82 @@ class MusicQueuePlayable(BasePlayable, AbstractOpus):
                     self.parent.cache.put_from_path(item.metadata['id'], tf.name)
 
                 item = item.pipe(FileProxyPlayable, tf, on_complete=commit)
-
         return item
 
-    @property
-    def now_playing(self):
-        if self._current:
-            return self._current
 
-        if not self._entries:
-            return
+class ChannelPlayer(object):
+    def __init__(self, parent, client, channel):
+        self.parent = parent
+        self.channel = channel
+        self.queue = MusicQueue(self.parent, on_next=self.on_next)
 
-        try:
-            self._current = self._get_next_playable()
-        except:
-            self.parent.log.exception('Failed to get a playble, retrying')
-            return self.now_playing
+        self._player = Player(client, queue=self.queue)
+        self._message = None
+        self._listener = self.channel.client.events.on(
+            'MessageReactionAdd', self.on_reaction_add, conditional=self.is_relevant_reaction
+        )
+        self._player.events.on(self._player.Events.DISCONNECT, self.on_disconnect)
 
-        self._on_play(self._current.metadata)
-        return self._current
+    def __del__(self):
+        # Explicitly remove the event listener
+        self._listener.remove()
 
-    def next_frame(self):
-        if self.now_playing:
-            frame = self.now_playing.next_frame()
-            if frame:
-                return frame
-            self._current = None
-            return self.next_frame()
+    def is_relevant_reaction(self, event):
+        return (
+            event.channel_id == self.channel.id and
+            event.emoji.name in ALL_EMOJIS and
+            event.user_id != self.channel.client.state.me.id and
+            event.message_id == self._message.id
+        )
 
-        self._event = Event()
-        self._event.wait()
-        self._event = None
-        return self.next_frame()
+    def on_reaction_add(self, event):
+        self._message.async_chain().delete_reaction(event.emoji.name, event.user_id)
+
+        if event.emoji.name == NEXT_TRACK:
+            self._player.skip()
+        elif event.emoji.name == PLAY_PAUSE:
+            self._player.resume() if self._player.paused else self._player.pause()
+        elif event.emoji.name == SHUFFLE:
+            self.queue.shuffle()
+        elif event.emoji.name == CLEAR:
+            self.queue.clear()
+        elif event.emoji.name == STOP:
+            self._player.disconnect()
+
+    def on_disconnect(self):
+        del self.parent.guilds[self.channel.guild.id]
+        del self
+
+    def on_next(self, item):
+        embed = self._get_embed_for_item(item.metadata)
+
+        if self._message:
+            self._message.edit(embed=embed)
+        else:
+            self._message = self.channel.send_message(embed=embed)
+            gevent.spawn(lambda: [self._message.add_reaction(reaction) for reaction in ALL_EMOJIS])
+
+        if len(self.parent.guilds) == 1:
+            self.parent.client.update_presence(
+                Status.ONLINE,
+                Game(type=GameType.DEFAULT, name=item.metadata['title']),
+            )
+
+    def _get_embed_for_item(self, info):
+        embed = MessageEmbed()
+        embed.title = u'{}'.format(info['title'])
+        embed.url = info['webpage_url']
+        embed.color = 0x77dd77
+        embed.set_image(url=info['thumbnail'])
+        embed.add_field(name='Uploader', value=info['uploader'])
+
+        if 'view_count' in info:
+            embed.add_field(name='Views', value=info['view_count'])
+
+        if 'duration' in info:
+            embed.add_field(name='Duration', value=humanize.naturaldelta(timedelta(seconds=info['duration'])))
+
+        return embed
 
 
 class MoosicPluginConfig(Config):
@@ -210,25 +183,16 @@ class MoosicPlugin(Plugin):
             return event.msg.reply('Failed to connect to voice: `{}`'.format(e))
 
         self.log.info('Connected to channel %s', channel)
-        player = Player(client)
-        self.guilds[event.guild.id] = MusicQueuePlayable(self, player, event.channel)
-        player.play(self.guilds[event.guild.id])
-        self.log.info('Player completed in channel %s', channel)
-        del self.guilds[event.guild.id]
+        self.guilds[event.guild.id] = ChannelPlayer(self, client, event.channel)
 
     def get_state(self, event):
         if event.guild.id not in self.guilds:
             raise CommandError("I'm not currently playing music here.")
         return self.guilds[event.guild.id]
 
-    @Plugin.command('leave')
-    def cmd_leave(self, event):
-        queue = self.get_state(event)
-        queue.player.disconnect()
-
     @Plugin.command('play', '<url:str>')
     def cmd_play(self, event, url):
-        queue = self.get_state(event)
+        player = self.get_state(event)
 
         event.msg.delete()
 
@@ -244,4 +208,5 @@ class MoosicPlugin(Plugin):
         msg.edit(':ok_hand: adding {} items to the playlist'.format(len(items))).after(5).delete()
 
         for item in items:
-            queue.add(item)
+            print('adding item')
+            player.queue.append(item)

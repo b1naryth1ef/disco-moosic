@@ -70,7 +70,8 @@ class LRUDiskCache(object):
         sorted_files = sorted(self._files.items(), key=lambda i: i[1]['created'])
 
         for path, obj in sorted_files:
-            os.remove(path)
+            if os.path.exists(path):
+                os.remove(path)
             amount -= obj['size']
 
             if amount <= 0:
